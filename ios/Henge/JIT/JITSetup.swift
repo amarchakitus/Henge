@@ -601,9 +601,12 @@ enum RemotePairingPortDiscovery {
         browser.browseResultsChangedHandler = { results, _ in
             guard !hasFinished() else { return }
 
+            // Only this device's own service, which is the one on loopback: every iPhone on the Wi-Fi
+            // advertises the same type, and another one's port is no use at 10.7.0.1. Without it the
+            // helper looks the port up itself (RSDPortResolver) and checks the service is this device's.
             let preferred = results.first { result in
                 result.interfaces.contains { $0.name == "lo0" }
-            } ?? results.first
+            }
             guard let result = preferred, case .service = result.endpoint else { return }
 
             resultLock.lock()

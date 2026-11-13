@@ -9,6 +9,11 @@ import dnssd
 /// (RemotePairingPortDiscovery) connects to the service to learn its port, and on some devices that never
 /// becomes ready. This reads the port from the service's SRV record with DNSServiceResolve instead, which
 /// needs no connection.
+///
+/// Every iPhone on the Wi-Fi advertises the same service type, so a service only counts when it is this
+/// device's own: seen on loopback, or its host resolves to an address of one of this device's interfaces.
+/// Taking the first service that resolved used another phone's port on shared networks. With none of its
+/// own found, the caller scans this device's ports instead (RSDPortScanner).
 enum RSDPortResolver {
     struct Result {
         var port: UInt16?
@@ -21,6 +26,8 @@ enum RSDPortResolver {
     /// Blocks for at most `timeout`. Call it off the main thread.
     static func resolve(timeout: TimeInterval = 4) -> Result {
         let state = State()
+        state.localAddresses = localAddresses()
+        state.loopbackIndex = if_nametoindex("lo0")
         let queue = DispatchQueue(label: "com.henge.app.jit-helper.rsd-port")
         let context = Unmanaged.passRetained(state)
         defer { context.release() }
@@ -40,11 +47,17 @@ enum RSDPortResolver {
             DNSServiceRefDeallocate(browseRef)
             state.resolveRefs.forEach(DNSServiceRefDeallocate)
             state.resolveRefs.removeAll()
+            state.addressRefs.forEach(DNSServiceRefDeallocate)
+            state.addressRefs.removeAll()
+            state.candidates.removeAll()
             state.finished = true
             if found, let port = state.port {
                 return Result(port: port, detail: "resolved \(serviceType) to port \(port) on \(state.host ?? "?")")
             }
             var detail = "no port within \(Int(timeout))s: \(state.seen) service(s) seen"
+            if !state.otherHosts.isEmpty {
+                detail += ", none on this device (skipped \(state.otherHosts.sorted().joined(separator: ", ")))"
+            }
             if let error = state.lastError { detail += ", last error \(describe(error))" }
             return Result(port: nil, detail: detail)
         }
@@ -55,6 +68,14 @@ enum RSDPortResolver {
         let done = DispatchSemaphore(value: 0)
         var queue: DispatchQueue?
         var resolveRefs: [DNSServiceRef] = []
+        var addressRefs: [DNSServiceRef] = []
+        /// Kept alive while their address lookups run; each lookup's context points at one.
+        var candidates: [Candidate] = []
+        /// Numeric addresses of this device's interfaces, without scope.
+        var localAddresses: Set<String> = []
+        var loopbackIndex: UInt32 = 0
+        /// Hosts of services that resolved to another device, for the log.
+        var otherHosts: Set<String> = []
         var seen = 0
         var port: UInt16?
         var host: String?
@@ -66,6 +87,19 @@ enum RSDPortResolver {
             self.port = port
             self.host = host
             done.signal()
+        }
+    }
+
+    /// A resolved service waiting for its host's addresses.
+    private final class Candidate {
+        unowned let state: State
+        let port: UInt16
+        let host: String
+        var matched = false
+        init(state: State, port: UInt16, host: String) {
+            self.state = state
+            self.port = port
+            self.host = host
         }
     }
 
@@ -89,17 +123,77 @@ enum RSDPortResolver {
         DNSServiceSetDispatchQueue(resolveRef, queue)
     }
 
-    private static let resolveCallback: DNSServiceResolveReply = { _, _, _, error, _, host, port, _, _, context in
+    private static let resolveCallback: DNSServiceResolveReply = { _, _, interface, error, _, host, port, _, _, context in
         guard let context else { return }
         let state = Unmanaged<State>.fromOpaque(context).takeUnretainedValue()
+        guard !state.finished, state.port == nil else { return }
         guard error == kDNSServiceErr_NoError else {
             state.lastError = error
             return
         }
         // The port arrives in network byte order.
         let value = UInt16(bigEndian: port)
-        guard value != 0 else { return }
-        state.finish(port: value, host: host.map { String(cString: $0) } ?? "?")
+        guard value != 0, let host else { return }
+        let hostName = String(cString: host)
+        // Only this device's own services are visible on loopback.
+        if state.loopbackIndex != 0, interface == state.loopbackIndex {
+            state.finish(port: value, host: hostName)
+            return
+        }
+        // Otherwise the service's host must resolve to one of this device's addresses.
+        let candidate = Candidate(state: state, port: value, host: hostName)
+        state.candidates.append(candidate)
+        var addressRef: DNSServiceRef?
+        let lookupError = DNSServiceGetAddrInfo(&addressRef, 0, interface,
+                                                DNSServiceProtocol(kDNSServiceProtocol_IPv4 | kDNSServiceProtocol_IPv6),
+                                                host, addressCallback, Unmanaged.passUnretained(candidate).toOpaque())
+        guard lookupError == kDNSServiceErr_NoError, let addressRef, let queue = state.queue else {
+            state.lastError = lookupError
+            return
+        }
+        state.addressRefs.append(addressRef)
+        DNSServiceSetDispatchQueue(addressRef, queue)
+    }
+
+    private static let addressCallback: DNSServiceGetAddrInfoReply = { _, flags, _, error, _, address, _, context in
+        guard let context else { return }
+        let candidate = Unmanaged<Candidate>.fromOpaque(context).takeUnretainedValue()
+        let state = candidate.state
+        guard !state.finished, state.port == nil, !candidate.matched else { return }
+        guard error == kDNSServiceErr_NoError, (flags & kDNSServiceFlagsAdd) != 0,
+              let address, let text = numericHost(address) else { return }
+        if state.localAddresses.contains(text) {
+            candidate.matched = true
+            state.otherHosts.remove(candidate.host)
+            state.finish(port: candidate.port, host: candidate.host)
+        } else {
+            state.otherHosts.insert(candidate.host)
+        }
+    }
+
+    /// This device's interface addresses, numeric and without scope.
+    private static func localAddresses() -> Set<String> {
+        var result: Set<String> = []
+        var list: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&list) == 0, let first = list else { return result }
+        defer { freeifaddrs(list) }
+        for entry in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            if let address = entry.pointee.ifa_addr, let text = numericHost(address) { result.insert(text) }
+        }
+        return result
+    }
+
+    /// An IPv4 or IPv6 address as text, without any "%scope".
+    private static func numericHost(_ address: UnsafePointer<sockaddr>) -> String? {
+        let family = Int32(address.pointee.sa_family)
+        guard family == AF_INET || family == AF_INET6 else { return nil }
+        let length = socklen_t(family == AF_INET ? MemoryLayout<sockaddr_in>.size : MemoryLayout<sockaddr_in6>.size)
+        var buffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        guard getnameinfo(address, length, &buffer, socklen_t(buffer.count), nil, 0, NI_NUMERICHOST) == 0 else {
+            return nil
+        }
+        let text = String(cString: buffer)
+        return text.split(separator: "%", maxSplits: 1).first.map(String.init)
     }
 
     private static func describe(_ error: DNSServiceErrorType) -> String {
