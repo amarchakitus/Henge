@@ -58,6 +58,10 @@ final class Installer: NSObject, ObservableObject {
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var received: Int64 = 0
     @Published private(set) var expected: Int64 = 0
+    /// How fast the download is going, smoothed; 0 until there is a second of it to go on.
+    @Published private(set) var bytesPerSecond: Double = 0
+    /// The last point the speed was measured from.
+    private var rateMark: (time: Date, bytes: Int64)?
     @Published private(set) var step: Int = 0
     @Published private(set) var stepProgress: Double = 0
     @Published private(set) var machineName = ""
@@ -167,6 +171,8 @@ final class Installer: NSObject, ObservableObject {
         let part = Self.partPath(r)
         received = RangedDownload.size(of: part)
         expected = r.bytes
+        bytesPerSecond = 0
+        rateMark = nil
         if received > 0 { HengeLog.log("install", "going on with \(r.name)'s download from \(ByteText.string(UInt64(received)))") }
         HengeLog.log("install", "downloading \(r.url.absoluteString)")
         for attempt in 1...20 {
@@ -174,6 +180,7 @@ final class Installer: NSObject, ObservableObject {
                 Task { @MainActor in
                     Installer.shared.received = have
                     if total > 0 { Installer.shared.expected = total }
+                    Installer.shared.measureRate(have)
                 }
             }
             do {
@@ -188,6 +195,21 @@ final class Installer: NSObject, ObservableObject {
             }
         }
         throw message("The download kept failing.")
+    }
+
+    /// Folds the bytes since the last measurement into the speed, at most once a second. A retry starts
+    /// again from what is on disk, so a count that went backwards only moves the mark.
+    private func measureRate(_ have: Int64) {
+        let now = Date()
+        guard let mark = rateMark, have >= mark.bytes else {
+            rateMark = (now, have)
+            return
+        }
+        let seconds = now.timeIntervalSince(mark.time)
+        guard seconds >= 1 else { return }
+        let rate = Double(have - mark.bytes) / seconds
+        bytesPerSecond = bytesPerSecond > 0 ? bytesPerSecond * 0.7 + rate * 0.3 : rate
+        rateMark = (now, have)
     }
 
 
