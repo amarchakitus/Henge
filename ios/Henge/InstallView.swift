@@ -185,6 +185,14 @@ struct InstallView: View {
         return installer.stepProgress
     }
 
+    /// While downloading: how much of how much, and how fast ("4.2 GB of 16 GB · 18.5 MB/s").
+    private var downloaded: String? {
+        guard case .downloading = installer.phase, installer.expected > 0 else { return nil }
+        var text = "\(ByteText.string(installer.received)) of \(ByteText.string(installer.expected))"
+        if installer.bytesPerSecond > 0 { text += " · \(ByteText.string(Int64(installer.bytesPerSecond)))/s" }
+        return text
+    }
+
     /// From how this step has gone so far; nothing until there is enough to go on.
     private var timeLeft: String? {
         let elapsed = Date().timeIntervalSince(stageStarted)
@@ -212,6 +220,13 @@ struct InstallView: View {
                     .padding(.top, 2)
                     .padding(.bottom, 16)
                 DeskBar(fraction: fraction, height: 11)
+                if let downloaded {
+                    Text(downloaded)
+                        .font(.system(size: 15))
+                        .monospacedDigit()
+                        .foregroundStyle(Desk.dim)
+                        .padding(.top, 12)
+                }
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 24)
