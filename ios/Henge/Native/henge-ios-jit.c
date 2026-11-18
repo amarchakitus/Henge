@@ -556,6 +556,13 @@ static void henge_ios_release_high_hold(void)
         }
 }
 
+/* A Mac is starting: its RAM is sized from, and allocated in, the address space these blocks hold (60 of the 64 GB
+   above 0x7000000000 when that is all there is), so they go before that, not only when QEMU claims its JIT region. */
+HENGE_EXPORT void henge_ios_release_high_room(void)
+{
+    henge_ios_release_high_hold();
+}
+
 /* The held blocks, once, for the translation layer to place large reservations in (they stay held: those are mapped
    over them). Returns how many (0 if none). */
 HENGE_EXPORT int henge_ios_take_high_room(void **base, size_t *bytes)
